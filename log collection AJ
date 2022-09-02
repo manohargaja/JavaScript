@@ -1,0 +1,303 @@
+									Project get-system-log
+									----------------------
+#!/bin/bash
+#set -e
+
+echo "Job Name             : ${JOB_NAME}"
+echo "Build Number         : ${BUILD_NUMBER}"
+echo "Talker/Listener Name : $Nodes"
+
+touch ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+
+#Compute the time in seconds from the Time_Frequency_Of_Test
+units=0
+Frequency_Time=`echo $Time_Frequency_Of_Test | cut -d ' ' -f1`
+Frequency_Unit_Of_Time=`echo $Time_Frequency_Of_Test | cut -d ' ' -f2`
+if [ "$Frequency_Unit_Of_Time" = "h" ]
+then
+    units=`expr 60 \\* 60`
+elif [ "$Frequency_Unit_Of_Time" = "m" ]
+then
+    units=60
+elif [ "$Frequency_Unit_Of_Time" = "s" ]
+then
+    units=1
+fi
+frequency_time_in_seconds_float=`expr $units*$Frequency_Time | bc`
+frequency_time_in_seconds=`awk -v frequency_time_in_seconds_float="$frequency_time_in_seconds_float" 'BEGIN {printf "%.0f", frequency_time_in_seconds_float }'`
+
+sleep $frequency_time_in_seconds
+
+IFS=","
+for sysStatistics in $System_Statistics
+do
+	echo "###############" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	echo "$sysStatistics" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	echo "###############" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	#Measure the CPU core utilization
+	if [ "$sysStatistics" = "CPU Core Utilization" ]; then
+		if test -d /proc/idleruntime/all
+		then
+		  haveall=1
+		else
+		  haveall=0
+		fi
+
+		for i in /proc/idleruntime/cpu*
+		do
+			name=`basename $i`
+			echo "$name usage: `awk '{ print (100.0 * $2) / ($1 + $2) }' <$i/data`%" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+			if test $haveall = 0
+			then
+				echo 1 >$i/reset
+			fi
+		done
+
+		if test $haveall = 1
+		then
+			i=/proc/idleruntime/all
+			echo "Average of all cores usage: `awk '{ print (100.0 * $2) / ($1 + $2) }' <$i/data`%" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+			echo 1 >$i/reset
+		fi
+	fi
+
+	#Measure the time which was spent in each CPU C States
+	if [ "$sysStatistics" = "CPU C States" ]; then
+		SYS=/sys/devices/system/cpu
+		if [ ! -e $SYS/cpuidle/current_driver ]
+		then
+			echo "Time spent in C states of the $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		else
+			driver=`cat $SYS/cpuidle/current_driver`
+			if test $driver = "none" || test $driver = "(none)" 
+			then
+				#ToDo: To be reviewed after seeing Carsten environment
+				echo "C state of the $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+			else
+				states=`ls -1 $SYS/cpu0/cpuidle/state*/time | wc -l`
+				maxstate=`expr $states - 1`
+
+				for i in `seq 0 $maxstate`
+				do
+					cstate[$i]=0
+					n=0
+					for j in `ls -d $SYS/cpu[0-9]*`
+					do
+						thistime=`cat $j/cpuidle/state$i/time`
+						thistime=`expr $thistime / 1000`
+						cstate[$i]=`expr ${cstate[$i]} + $thistime`
+						n=`expr $n + 1`
+					done
+					cstate[$i]=`expr ${cstate[$i]} / $n`
+					#echo cstate$i.value ${cstate[$i]}
+					statename="`cat $SYS/cpu0/cpuidle/state$i/name`"
+					echo "Time spent in C state $i ($statename) is ${cstate[$i]}" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+				done
+			fi
+		fi
+	fi
+
+	#Measure CPU power consumption per component
+	if [ "$sysStatistics" = "CPU Power Consumption" ]; then
+		dir=/sys/devices/power/events
+		if ! test -d $dir
+		then
+			echo "Power consumption of CPU components in $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		elif [ -e /var/cache/pmu-power ]
+		then
+			if grep -q Joules$ /var/cache/pmu-power
+			then
+				greparg="-B1"
+			else
+				greparg=""
+			fi
+
+			cd $dir
+			for i in `ls -1 energy-* | grep -v \\\\. | sed s,energy-,,`
+			do
+				var=`echo $i | cut -d- -f2 | cut -d. -f1`
+				cd $WORKSPACE
+				echo "Power consumption of $var component" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+				echo $i `grep $greparg energy-$i /var/cache/pmu-power | head -1 | tr -d , | awk '{ print $2 / $1; }'` >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+			done
+		else
+			for i in /sys/class/powercap/*
+			do
+				cd $i
+				if [ -e name ] && [ -e energy_uj ]
+				then
+					component_name=`cat name`
+					energy_in_joules=`awk '{print $1*10^-6 " Joules"}' energy_uj`
+					cd $WORKSPACE
+					echo "Power consumption of power zone $component_name is $energy_in_joules" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+				fi
+			done
+		fi
+	fi
+
+	#Measure memory usage
+	if [ "$sysStatistics" = "Memory Usage" ]; then
+		free -h >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	fi
+
+	#Measure temperature
+	if [ "$sysStatistics" = "Temperature" ]; then
+		if ! command -v sensors &> /dev/null
+		then
+			sudo apt-get install lm-sensors -y
+		fi
+		core_temp=`sensors | grep Core`
+		if [ -z "$core_temp" ]
+		then
+			echo "Temperature of cores of $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		else
+			echo $core_temp >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		fi
+	fi
+
+	#Measure temperature
+	if [ "$sysStatistics" = "Fan Speed" ]; then
+		if ! command -v sensors &> /dev/null
+		then
+			sudo apt-get install lm-sensors -y
+		fi
+		fan_speed=`sensors | grep fan`
+		if [ -z "$fan_speed" ]
+		then
+			echo "Fan speed of $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		else
+			echo $fan_speed >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		fi
+	fi
+
+	#Measure Number of Interrupts and Context Switches
+	if [ "$sysStatistics" = "Number of Interrupts and Context Switches" ]; then
+		if [ -e /proc/stat ]
+		then
+			awk '$1 == "intr" { print "Number of Interrupts is " $2 }' /proc/stat >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+			awk '$1 == "ctxt" { print "Number of Context Switches is " $2 }' /proc/stat >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		else
+			echo "Number of Interrupts and Context Switches of $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		fi
+	fi
+
+	#Measure Entropy - the number of random bytes available (Used for cryptographic applications)
+	if [ "$sysStatistics" = "Entropy" ]; then
+		if [ -e /proc/sys/kernel/random/entropy_avail ]
+		then
+			entropy_in_bytes=`cat /proc/sys/kernel/random/entropy_avail`
+			echo "Available entropy is $entropy_in_bytes bytes" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		else
+			echo "Available entropy of $Nodes cannot be determined" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+		fi
+	fi
+
+	#Measure total uptime of the system
+	if [ "$sysStatistics" = "Total Uptime" ]; then
+		uptime_formatted=`uptime -p`
+		uptime_formatted=${uptime_formatted//up/}
+		echo "$Nodes uptime is$uptime_formatted" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	fi
+	echo "###############" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+	echo "" >> ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+done
+sudo mv ${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log /$Nodes-nfsroot/${BUILD_TAG}-iteration-${Iteration_Number}-${NODE_NAME}.log
+
+
+###############################################################################################################################################################
+
+
+														Project copy-trace-file
+														-----------------------
+
+
+#!/bin/bash
+set -e
+
+echo "Job Name             : ${JOB_NAME}"
+echo "Build Number         : ${BUILD_NUMBER}"
+echo "Talker/Listener Name : ${NODE_NAME}"
+
+if [ ! -e /$Nodes-nfsroot/$Trace_File ]; then
+    echo "/$Nodes-nfsroot/$Trace_File file not found"
+    echo "Please check if $Nodes is mounted using \"cfg-nfsmounts\" job"
+	exit 1
+fi
+
+cp /$Nodes-nfsroot/$Trace_File $Scenario_Workspace
+
+
+
+#####################################################################
+
+
+
+													Project run-remove-trace-file
+													-----------------------------
+
+
+
+#!/bin/bash
+set -e
+
+# Statements to print the Job Name, Build Number and Node Name
+echo "Job Name             : ${JOB_NAME}"
+echo "Build Number         : ${BUILD_NUMBER}"
+echo "Talker/Listener Name : ${NODE_NAME}"
+
+# Global Variable - Constants
+# Source Path of tracefile
+TRACE_FILE_PATH="/"$Nodes"-nfsroot"
+
+# Variable to store the trace files given by the user
+trace_files="$(echo "$Trace_File" | sed 's/,/ /g')"
+
+# Iterating through the files in variable using for loop
+for trace_file in $trace_files; do
+  #Check if the file $trace_file exists
+  if test -e "$TRACE_FILE_PATH"/"$trace_file"; then
+    echo "$trace_file"
+    #Remove the given $trace_file
+    sudo rm -rf "$TRACE_FILE_PATH"/"$trace_file"
+  fi
+done
+
+
+
+###########################################################################
+
+				Execute system Groovy script
+
+
+
+import javax.mail.*
+import javax.mail.internet.*
+import jenkins.model.*
+import hudson.AbortException
+
+def currentBuild = Thread.currentThread().executable
+
+def sendEmail = build.getBuildVariables().get('Send_Email')
+
+def sendMail(receivers, subject, text) {
+    Properties props = System.getProperties()
+    Session session = Session.getDefaultInstance(props, null)
+
+    MimeMessage message = new MimeMessage(session)
+    receivers.split(',').each {
+        message.addRecipient(Message.RecipientType.TO, new InternetAddress(it))
+    }
+    message.setSubject(subject)
+    message.setText(text)
+    println 'Sending mail to ' + receivers + '.'
+    Transport.send(message)
+}
+if(sendEmail == "true") {
+	String jobName = build.getEnvironment(listener).get('JOB_NAME')
+	String buildNumber = build.getEnvironment(listener).get('BUILD_NUMBER')
+	String messageReceivers = build.getEnvironment(listener).get('BUILD_USER_EMAIL')
+	String messageSubject = "KALFSET | ${jobName} | Build Number: ${buildNumber} | " + currentBuild.result;
+    String userName = build.getEnvironment(listener).get('BUILD_USER_FIRST_NAME')
+	String messageAllText= "Hi " +userName + ",\n\nStatus of the build ${buildNumber} for the test ${jobName} is " + currentBuild.result + ".\n\nYou can also view the detailed test log from the link below:\n"+ build.getEnvironment(listener).get('BUILD_URL') +"console\n\nRegards,\nFSET Jenkins"
+    sendMail(messageReceivers, messageSubject, messageAllText)
+}
