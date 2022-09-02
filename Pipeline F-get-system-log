@@ -1,0 +1,399 @@
+import hudson.model.*
+import groovy.json.JsonSlurper
+import org.jvnet.jenkins.plugins.nodelabelparameter.*
+import org.jvnet.jenkins.plugins.nodelabelparameter.node.AllNodeEligibility;
+import jenkins.model.Jenkins;
+import jenkins.*
+import jenkins.model.*
+
+/* Global parameters */
+/* Variable to get node names in string array */
+List<String> nodeNames = new ArrayList<>()
+
+/* Parameters to run jobs */
+List<ParameterValue> runParams = new ArrayList<>()
+
+/* Test case parameters */
+hudson.model.StringParameterValue testCases
+
+/* Variable to get the details of test group and test cases ids */
+def mapTestCaseID = [:]
+
+/* File to store the console logs */
+def file_Name
+boolean continueBuild = true
+
+pipeline {
+	options {
+        ansiColor('xterm')
+    }
+    agent {
+        label "master"
+    }
+    stages {
+        /* Start of stage 1 */
+        stage ('Check Parameters') {
+            steps {
+                script {
+                    if(Archive_Artifacts == "true") {
+						git credentialsId: '991ddc69-0778-47a3-858f-41454234c508', url: 'http://172.17.4.171:8080/KALFSET-artifacts.git'
+						sh'''#!/bin/bash
+						    set +x
+						    echo "false">cfgArchiveBranch.txt
+						    checkBranchExists=`git branch -a | grep -w "remotes/origin/$JOB_NAME"`
+                            if [ -z "$checkBranchExists" ]
+                            then
+                                echo "true">cfgArchiveBranch.txt
+                            fi
+						'''
+    					cfgBranchFileContent = readFile 'cfgArchiveBranch.txt'
+                        cfgBranchBuildValue=cfgBranchFileContent.readLines().get(0)
+                        if(cfgBranchBuildValue == "true"){
+                            buildJob = build job: 'cfg-archive-branch', parameters: [new StringParameterValue('Test_Name', JOB_NAME)],propagate: false
+    						jobBuildResult=buildJob.getResult()
+    						if (jobBuildResult == "FAILURE") {
+    							continueBuild = false
+    							currentBuild.result = 'FAILURE'
+    							lock('writeConsoleOutput') {
+    								sh script: "echo Iteration Number     : 1 >> ${file_Name}"
+    								writeConsoleOutput(buildJob,file_Name)
+    								sh script: "echo >> ${file_Name}"
+    							}
+    						}
+                        }
+						withCredentials([usernamePassword(credentialsId: '991ddc69-0778-47a3-858f-41454234c508', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+							sh'''#!/bin/bash
+								set +x
+								git fetch --tags --progress -- http://${GIT_USERNAME}:${GIT_PASSWORD}@172.17.4.171:8080/KALFSET-artifacts.git +refs/heads/*:refs/remotes/origin/*
+								git checkout remotes/origin/$JOB_NAME -b $JOB_NAME
+								mkdir -p ${JOB_NAME}-${BUILD_NUMBER}
+							'''
+						}
+                    }
+                    def currentBuildParams = currentBuild.rawBuild.getAction(hudson.model.ParametersAction).getParameters()
+                    def pathToFile = pwd()
+                    file_name = "${JOB_NAME}-${BUILD_NUMBER}.txt"
+                    file_Name = pathToFile + "/" + file_name
+                    writeFile file: file_Name, text: ''
+                    runParams += new StringParameterValue('Scenario_Workspace', pathToFile)
+
+                    currentBuildParams.each {
+						if (it.name == "tests")
+                        /*Get the test case parameters */
+                            testCases = it
+                        else {
+							if (it.name == 'Nodes') {
+								/* Get the node names in a string from multi selection parameter */
+							   nodeNames=it.value.split(",")
+							}
+							else if (it.name == 'Send_Email') {
+                                runParams += new BooleanParameterValue('Send_Email', false)
+                            }
+							else {
+								/* Get the build parameters */
+								runParams += it
+							}
+						}
+                    }
+					sh '''#!/bin/bash
+						set +x
+						echo "true">currentBuild.txt
+						file_Name=${JOB_NAME}-${BUILD_NUMBER}.txt
+
+						#Check if the Nodes are chosen
+						if [ -z $Nodes ]
+						then
+							echo "\033[1;31m[ERROR]: No nodes chosen in Nodes parameter \033[0m"
+							echo "[ERROR]: No nodes chosen in Nodes parameter" >> $file_Name
+							echo "false">currentBuild.txt
+						fi
+
+						#Check if the system statistics is been chosen
+						if [ -z "$System_Statistics" ]
+						then
+							echo "\033[1;31m[ERROR]: No parameters has been chosen chosen in System_Statistics \033[0m"
+							echo "[ERROR]: No parameters has been chosen chosen in System_Statistics" >> $file_Name
+							echo "false">currentBuild.txt
+						fi
+					'''
+
+                    continueBuildFileContent = readFile 'currentBuild.txt'
+                    continueBuildValue=continueBuildFileContent.readLines().get(0)
+                    if(continueBuildValue == "false"){
+                        continueBuild=false
+                    }
+
+					def jsonSlurper = new JsonSlurper()
+                    Object object = jsonSlurper.parseText("${testCases.value}")
+                    object.each {
+                        if (it.testgroup == "FSET Packages") {
+                            mapTestCaseID[it.testID] = ["Not Executed", it.testcase, it.multiplicity]
+                        }
+                    }
+					/* TODO: Need to bring in job to check if the environment is intact and supports for proceeding with the feature */
+                }
+            }
+        }
+
+        /* Stage 2 - Collect System Log */
+        stage ('System Log Collection') {
+            when {
+                expression { continueBuild }
+            }
+            steps {
+                script {
+					if (mapTestCaseID.containsKey('TC-0A-01')) {
+						/* Iteration of test cases */
+						int testCasePassCount = 0
+						//timeFrequencyInSeconds=computeTimeInSeconds(Time_Frequency_Of_Test)
+						//echo "${timeFrequencyInSeconds}"
+						//iteration_Count=0
+						for(int iterations = 1; iterations <= mapTestCaseID['TC-0A-01'][2]; iterations++) {
+							runParams += [ new StringParameterValue('Iteration_Number', Integer.toString(iterations)) ]
+							def parallel_get_trace = [:]
+							def buildJobGetTrace = [:]
+							def trace_file_name = [:]
+							//sleep(timeFrequencyInSeconds)
+							/* Capture System Log */
+							if(continueBuild) {
+								nodeNames.each {
+									def getParams = runParams + new NodeParameterValue('Nodes', '', it)
+									parallel_get_trace[it] = {
+										buildJobGetTrace[it] = build job: 'get-system-log', parameters: getParams,propagate: false
+										jobBuildResult=buildJobGetTrace[it].getResult()
+										trace_file_name[it]="jenkins-get-system-log-" + buildJobGetTrace[it].number +"-iteration-" + iterations + "-" + it + ".log"
+										if (jobBuildResult == "FAILURE")
+										{
+											currentBuild.result = 'FAILURE'
+											continueBuild = false
+											lock('writeConsoleOutput') {
+												sh script: "echo Iteration Number     : ${iterations} >> ${file_Name}"
+												writeConsoleOutput(buildJobGetTrace[it],file_Name)
+												sh script: "echo >> ${file_Name}"
+											}
+										}
+									}
+								}
+								parallel (parallel_get_trace)
+
+								/* Copy System Log to Orchestrator */
+								if(continueBuild) {
+									def parallel_copy_trace = [:]
+									def buildJobCopy = [:]
+									nodeNames.each {
+										def copyParams = runParams + new StringParameterValue('Nodes', it) + new StringParameterValue('Trace_File',trace_file_name[it])
+										parallel_copy_trace[it] = {
+											buildJobCopy[it] = build job: 'copy-trace-file', parameters: copyParams,propagate: false
+											jobBuildResultCopy=buildJobCopy[it].getResult()
+											if (jobBuildResultCopy == "FAILURE") {
+												continueBuild = false
+												currentBuild.result = 'FAILURE'
+												lock('writeConsoleOutput') {
+													sh script: "echo Iteration Number     : ${iterations} >> ${file_Name}"
+													writeConsoleOutput(buildJobCopy[it],file_Name)
+													sh script: "echo >> ${file_Name}"
+												}
+											} else if (jobBuildResultCopy == "SUCCESS") {
+												archiveArtifacts artifacts: trace_file_name[it], fingerprint: true
+												//boolean fileSuccessfullyDeleted =  new File(trace_file_name[it]).delete()  
+												//println fileSuccessfullyDeleted
+												if(Archive_Artifacts == "true") {
+													sh "bash -c \" mv ${trace_file_name[it]} ${JOB_NAME}-${BUILD_NUMBER}\"" 
+													//sh("git add ${JOB_NAME}-${BUILD_NUMBER}/${trace_file_name[it]}")
+													//sh "bash -c \" rm -rf ${JOB_NAME}-${BUILD_NUMBER}/${trace_file_name[it]}\"" 
+												} else {
+													sh "bash -c \" rm -rf ${trace_file_name[it]}\""
+												}
+											}
+										}
+									}
+									parallel (parallel_copy_trace)
+								}
+								
+								/* Remove System Log from Nodes */
+								if(continueBuild) {
+									def parallel_remove_trace = [:]
+									def buildJobRemove = [:]
+									nodeNames.each {
+										parallel_remove_trace[it] = {
+											buildJobRemove[it] = build job: 'run-remove-trace-file', parameters: [new StringParameterValue('Trace_File', trace_file_name[it]),new NodeParameterValue('Nodes', '', it)],propagate: false
+											jobBuildResultRemove=buildJobRemove[it].getResult()
+											if (jobBuildResultRemove == "FAILURE") {
+												continueBuild = false
+												currentBuild.result = 'FAILURE'
+												lock('writeConsoleOutput') {
+													sh script: "echo Iteration Number     : ${iterations} >> ${file_Name}"
+													writeConsoleOutput(buildJobRemove[it],file_Name)
+													sh script: "echo >> ${file_Name}"
+												}
+											}
+										}
+									}
+									parallel (parallel_remove_trace)
+								}
+							} else {
+								/* Return (exit the for loop) if the continueBuild flag is set as false */
+								return
+							}
+							if(continueBuild) {
+								testCasePassCount++
+								mapTestCaseID['TC-0A-01'][0] = "${testCasePassCount}"
+								echo "Automate System Log Collection executed successfully for the iteration - ${testCasePassCount}"
+							}
+						}
+						if(Archive_Artifacts == "true") {
+							withCredentials([usernamePassword(credentialsId: '991ddc69-0778-47a3-858f-41454234c508', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+						        sh'''#!/bin/bash
+						            set +x
+									if [ ! -z "$(ls -A ${JOB_NAME}-${BUILD_NUMBER})" ]; then
+										zip -r ${JOB_NAME}-${BUILD_NUMBER}.zip ${JOB_NAME}-${BUILD_NUMBER}
+										git add ${JOB_NAME}-${BUILD_NUMBER}.zip
+									fi
+						            checkFiles=`git status --porcelain | awk 'match($1, "A") {print $2}'`
+						            if [ ! -z "$checkFiles" ]
+						            then
+								        git commit -am ${JOB_NAME}-${BUILD_NUMBER}
+								        git tag -a ${JOB_NAME}-${BUILD_NUMBER} -m ${JOB_NAME}-${BUILD_NUMBER}
+								        git push http://${GIT_USERNAME}:${GIT_PASSWORD}@172.17.4.171:8080/KALFSET-artifacts && git push http://${GIT_USERNAME}:${GIT_PASSWORD}@172.17.4.171:8080/KALFSET-artifacts --tags
+								    fi
+							    '''
+							}
+						}
+					}
+				}
+			}
+        }
+
+    }
+
+
+    /* Post build action of the declarative pipeline to show test result */
+    post {
+        always {
+            script {
+                if (!continueBuild) {
+                    currentBuild.result = 'FAILURE' 
+                }
+                if(Send_Email == "true") {
+					wrap([$class: 'BuildUser']) {
+						def userName = env.BUILD_USER_FIRST_NAME
+						boolean attachReport = true
+						def consoleReport = readFile("${JOB_NAME}-${BUILD_NUMBER}.txt")
+						if (consoleReport.size() == 0) {
+							attachReport = false
+						}
+						String subject = "KALFSET | ${JOB_NAME} | Build Number: ${BUILD_NUMBER} | " + currentBuild.result.toString()
+						String body= "Hi " +userName + ",\n\nStatus of the build ${BUILD_NUMBER} for the test ${JOB_NAME} is " + currentBuild.result + ".\n\nYou can also view the detailed test log from the link below:\n"+ BUILD_URL +"console"
+						if (currentBuild.result.toString() == "ABORTED") {
+							def causee = ''
+							def actions = currentBuild.rawBuild.getAction(jenkins.model.InterruptedBuildAction)
+							for (action in actions) {
+							def causes = action.getCauses()
+								// on cancellation, report who cancelled the build
+								for (cause in causes) {
+									causee = cause.getUser().getDisplayName()
+									cause = null
+								}
+							causes = null
+							action = null
+							}
+							actions = null
+						
+							body += "\nBuild ${BUILD_NUMBER} of ${env.JOB_NAME} was aborted by the user " + causee
+						}
+						if(attachReport) {
+							body += "\n\nPlease see the attachment for further details\n\nRegards,\nFSET Jenkins"
+							emailext(attachmentsPattern: '${JOB_NAME}-${BUILD_NUMBER}.txt', subject: subject, body: body, recipientProviders: [buildUser()])
+						}
+						else {
+							body += "\n\nRegards,\nFSET Jenkins"
+							emailext(subject: subject, body: body, recipientProviders: [buildUser()])
+						}
+					}
+				}
+				if(Archive_Artifacts == "true") {
+					sh'''#!/bin/bash
+                        set +x
+						rm -rf ${JOB_NAME}-${BUILD_NUMBER}
+                    '''
+				}
+                String resultString = ""
+				if (mapTestCaseID != [:]) {
+                    resultString +=  "###############################\n"
+                    resultString +=  "System Log Collection result\n"
+                    mapTestCaseID.each {
+						k,v ->
+						if(v[0].toString().isInteger() && v[0]=="1") {
+							resultString += "\n${v[1]} executed successfully for ${v[0]} iteration"
+						} else if(v[0].toString().isInteger() && v[0]!="1") {
+							resultString += "\n${v[1]} executed successfully for ${v[0]} iterations"
+						}
+						else {
+							resultString += "\n${v[1]} - ${v[0]}"
+						}
+                    }
+                    resultString +=  "\n###############################"
+                }
+
+                println resultString
+
+				def pathToFile = pwd()
+                sh'''#!/bin/bash
+                    set +x
+                    if [ ! -s "${JOB_NAME}-${BUILD_NUMBER}.txt" ]; then
+                        rm -rf ${JOB_NAME}-${BUILD_NUMBER}.txt
+                    fi
+                '''
+                if (fileExists(file_Name)) {
+                    echo "Console output captured in file name - ${JOB_NAME}-${BUILD_NUMBER}.txt"
+                    archiveArtifacts artifacts: '${JOB_NAME}-${BUILD_NUMBER}.txt', fingerprint: true
+                    sh'''#!/bin/bash
+                        set +x
+                        rm -rf ${JOB_NAME}-${BUILD_NUMBER}.txt
+                    '''
+                }
+				cleanWs()
+            }
+        }
+    }
+}
+
+ def computeTimeInSeconds(def timeWithUnit) {
+	int units=0
+	time = Float.valueOf(timeWithUnit.split(" ")[0])
+	unitOfTime = timeWithUnit.split(" ")[1]
+
+	if(unitOfTime == "h") {
+		units=60*60
+	} else if(unitOfTime == "m") {
+		units=60
+	} else if(unitOfTime == "s") {
+		units=1
+	}
+
+	timeInSeconds=units*time
+	timeInSecondsInt= timeInSeconds.toInteger()
+	return timeInSecondsInt
+}
+
+def writeConsoleOutput(def buildJob, def file_Name) {
+	jobBuildNumber=buildJob.number
+	jobBuildName=buildJob.getProjectName()
+	//jobBuildUrl=buildJob.getAbsoluteUrl()
+	jobBuildLog = Jenkins.getInstance().getItemByFullName(jobBuildName).getBuildByNumber(jobBuildNumber).logFile.text
+	writeFile file: "temporary_consolelog.txt", text: jobBuildLog
+	sh '''
+    	set +x
+		startExtraction="Building "
+		endExtraction="Finished:"
+		startExtractionLineNum=`grep -n "$startExtraction" temporary_consolelog.txt | grep -Eo '^[^:]+'`
+		#Extract from next line
+		startExtractionLineNum=`expr $startExtractionLineNum+1 | bc`
+		endExtractionLinNum=`grep -n "$endExtraction" temporary_consolelog.txt | grep -Eo '^[^:]+'`
+		endExtractionLinNum=`expr $endExtractionLinNum-1 | bc`
+		sed -i -n "$startExtractionLineNum,$endExtractionLinNum p;" temporary_consolelog.txt
+	'''
+	jobBuildLog = readFile "temporary_consolelog.txt"
+	def readContent = readFile "${file_Name}"
+	writeFile file: "${file_Name}", text: readContent + "\n" + jobBuildLog
+}
